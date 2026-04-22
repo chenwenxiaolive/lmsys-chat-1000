@@ -4,12 +4,18 @@ maas_bench.py
 
 用 LMSYS multi-turn conversation 数据集压测 OpenAI 兼容的 MaaS API。
 
-核心：
-  - 会话内 turn 串行（同一 conversation 的 A→B→C 顺序）
-  - 会话间并发（多个 conversation 同时发，模拟多用户）
-  - 第 N 轮 prompt = 前 N-1 轮完整历史 + 当前 user message（天然 prefix 累积）
-  - 流式接收精确测 TTFT
-  - 分层统计（按 turn_idx 和 prompt 长度）
+调度模式（wave）：
+  所有请求按 (turn_idx, conversation_index) 排序。
+  第 1 轮 wave 同时发完所有 conversation 的第 1 个 user message；全部完成后
+  才开始第 2 轮 wave，以此类推。每一轮 wave 内部用 semaphore 限制同时
+  in-flight 的请求数为 --concurrency。
+
+  这样：
+  - 首轮 wave = 所有 "全新" prompt，不能命中外部 KV pool → 冷启动 TTFT
+  - 第 2+ 轮 wave = 上一轮 KV 已在 pool，触发 prefix cache 命中 → 命中后 TTFT
+  - 同一 conversation 的多轮 prompt 保持前缀累积关系（A→A+B→A+B+C）
+
+采集：流式 TTFT、完整 E2EL、按 turn_idx 分层
 
 模式：
   --mode replay（默认）：用 dataset 里原始 assistant 回复作下一轮历史
@@ -106,57 +112,107 @@ async def send_chat(session, endpoint, model, messages, api_key,
     }
 
 
-async def run_conversation(session, args, conv, sink):
-    """按 turn 顺序串行发送单个 conversation 的所有 user 轮次"""
-    conv_id = conv["conversation_id"]
-    history = []
-    turn_idx = 0
+def precompute_turns(conv):
+    """
+    把 conversation 拆成 [(user_msg, assistant_msg_or_None), ...]。
+    对于只有 user 无 assistant 的尾巴，assistant_msg 为 None。
+    """
+    turns = []
     msgs = conv["conversation"]
     i = 0
-
     while i < len(msgs):
-        m = msgs[i]
-        if m["role"] != "user":
+        if msgs[i]["role"] != "user":
             i += 1
             continue
-
-        to_send = history + [m]
-        r = await send_chat(session, args.endpoint, args.model,
-                            to_send, args.api_key, args.max_tokens)
-        r["conversation_id"] = conv_id
-        r["turn_idx"] = turn_idx
-        r["prompt_msg_count"] = len(to_send)
-        r["prompt_chars"] = sum(len(x["content"]) for x in to_send)
-        sink.append(r)
-
-        history.append(m)
-        if args.mode == "replay":
-            # 下一轮历史用 dataset 原始 assistant
-            if i + 1 < len(msgs) and msgs[i + 1]["role"] == "assistant":
-                history.append(msgs[i + 1])
-                i += 2
-            else:
-                i += 1
-        else:  # live
-            if r.get("completion") and not r.get("error"):
-                history.append({"role": "assistant",
-                                "content": r["completion"]})
+        u = msgs[i]
+        a = None
+        if i + 1 < len(msgs) and msgs[i + 1]["role"] == "assistant":
+            a = msgs[i + 1]
+            i += 2
+        else:
             i += 1
-        turn_idx += 1
+        turns.append((u, a))
+    return turns
+
+
+async def send_one_turn(session, args, conv, turn_idx, sink):
+    """
+    发送 conv 的第 turn_idx 轮。
+    prompt = 前 turn_idx 轮的 (user + assistant) + 当前 user message。
+    assistant 历史：replay 模式用 dataset 的；live 模式用 MaaS 生成的。
+    """
+    turns = conv["_turns"]
+    history = []
+    for i in range(turn_idx):
+        u, a = turns[i]
+        history.append(u)
+        if args.mode == "replay":
+            if a is not None:
+                history.append(a)
+        else:  # live：前一轮 MaaS 的 completion
+            live_reply = conv.get("_live", {}).get(i)
+            if live_reply:
+                history.append({"role": "assistant", "content": live_reply})
+            elif a is not None:
+                # 万一 live 缺失（报错等），用 dataset 兜底
+                history.append(a)
+
+    current_user, _ = turns[turn_idx]
+    messages = history + [current_user]
+
+    r = await send_chat(session, args.endpoint, args.model,
+                        messages, args.api_key, args.max_tokens)
+    r["conversation_id"] = conv["conversation_id"]
+    r["turn_idx"] = turn_idx
+    r["prompt_msg_count"] = len(messages)
+    r["prompt_chars"] = sum(len(m["content"]) for m in messages)
+    sink.append(r)
+
+    if args.mode == "live" and not r.get("error") and r.get("completion"):
+        conv.setdefault("_live", {})[turn_idx] = r["completion"]
 
 
 async def run_all(args, convs):
+    """
+    按 (turn_idx, conversation_index) 排序调度，并发由 --concurrency 控制。
+    实现为 wave 式：依次处理第 1、2、3... 轮。
+    每一轮内，所有 conversation 的请求按 conv_idx 顺序进入 semaphore 队列；
+    同时最多 args.concurrency 个请求在 MaaS 上运行。
+    某一轮全部完成后，才开始下一轮。
+    """
+    for c in convs:
+        c["_turns"] = precompute_turns(c)
+
     sem = asyncio.Semaphore(args.concurrency)
     sink = []
     connector = aiohttp.TCPConnector(limit=args.concurrency * 2)
+    max_turn = max(len(c["_turns"]) for c in convs)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        async def bounded(c):
-            async with sem:
-                await run_conversation(session, args, c, sink)
-
         t0 = time.perf_counter()
-        await asyncio.gather(*[bounded(c) for c in convs])
+
+        for turn_idx in range(max_turn):
+            tasks = []
+            for c in convs:
+                if turn_idx >= len(c["_turns"]):
+                    continue
+
+                async def bounded(c=c, ti=turn_idx):
+                    async with sem:
+                        await send_one_turn(session, args, c, ti, sink)
+
+                tasks.append(bounded())
+
+            if not tasks:
+                continue
+
+            wave_start = time.perf_counter()
+            await asyncio.gather(*tasks)
+            wave_elapsed = time.perf_counter() - wave_start
+            print(f"  Wave {turn_idx + 1:2d}: {len(tasks):5d} requests, "
+                  f"{wave_elapsed:6.1f}s "
+                  f"({len(tasks)/wave_elapsed:.1f} req/s)")
+
         duration = time.perf_counter() - t0
 
     return sink, duration
